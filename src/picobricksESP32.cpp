@@ -318,140 +318,175 @@ NEOPIXEL LIBRARY
 // Constructor for NeoPixel class
 // Initializes the NeoPixel object with the number of LEDs (n) and pin (p).
 // It also sets initial values for other parameters.
-NeoPixel::NeoPixel(uint16_t n, int16_t p)
-  : begun(false), brightness(0), pixels(NULL), endTime(0) {
-  updateType();  // Updates the pixel type (RGB or RGBW).
-  updateLength(n);  // Updates the length (number of LEDs) of the strip.
-  setPin(p);  // Sets the pin number.
+NeoPixel::NeoPixel(uint16_t ledCount, int pin
+#ifdef PB_CORE_V2
+                   , rmt_channel_t ch
+#endif
+)
+: _pin(pin),
+  _pin_enum((gpio_num_t)pin),
+  _ledCount(ledCount),
+  _brightness(255),
+  _pixels(nullptr),
+  _begun(false)
+#ifdef PB_CORE_V2
+ , _channel(ch)
+ , _items(nullptr)
+ , _itemsLen(ledCount * 24)
+#endif
+#ifdef PB_CORE_V3
+ , _txChannel(nullptr)
+ , _ledEncoder(nullptr)
+ , _txConfig{}
+#endif
+{}
+
+NeoPixel::~NeoPixel() { end(); }
+
+void NeoPixel::applyBrightness(uint8_t &r, uint8_t &g, uint8_t &b) const {
+  if (_brightness == 255) return;
+  uint16_t br = _brightness + 1; // 1–256
+  r = (uint8_t)((r * br) >> 8);
+  g = (uint8_t)((g * br) >> 8);
+  b = (uint8_t)((b * br) >> 8);
 }
 
-// Initializes the pin and sets it to OUTPUT mode.
-void NeoPixel::begin(void) {
-  if (pin >= 0) {
-    pinMode(pin, OUTPUT);
-    digitalWrite(pin, LOW);
-  }
-  begun = true;
+void NeoPixel::clear() { if (_pixels) memset(_pixels, 0, _ledCount * 3); }
+
+void NeoPixel::setBrightness(uint8_t b) { _brightness = b; }
+
+void NeoPixel::setPixelColor(uint16_t i, uint8_t r, uint8_t g, uint8_t b) {
+  if (i >= _ledCount || !_pixels) return;
+  applyBrightness(r, g, b);
+  uint16_t base = i * 3;
+  _pixels[base + 0] = g; // GRB
+  _pixels[base + 1] = r;
+  _pixels[base + 2] = b;
 }
 
-// Updates the length of the NeoPixel strip, reallocates memory to store pixel data.
-// Resets pixel data to all zeros.
-void NeoPixel::updateLength(uint16_t n) {
-  free(pixels);  // Free existing data (if any)
-
-  // Allocate new memory to store pixel data (either 3 bytes for RGB or 4 for RGBW).
-  numBytes = n * ((wOffset == rOffset) ? 3 : 4);
-  if ((pixels = (uint8_t *)malloc(numBytes))) {
-    memset(pixels, 0, numBytes);
-    numLEDs = n;
-  } else {
-    numLEDs = numBytes = 0;
-  }
+void NeoPixel::fill(uint8_t r, uint8_t g, uint8_t b) {
+  for (uint16_t i = 0; i < _ledCount; ++i) setPixelColor(i, r, g, b);
 }
 
-// Updates the type of the NeoPixel strip (RGB or RGBW) based on offsets.
-void NeoPixel::updateType() {
-  bool oldThreeBytesPerPixel = (wOffset == rOffset);  // false if RGBW
+// ---------- begin() ----------
+bool NeoPixel::begin() {
+  if (_begun) return true;
 
-  // Set the offsets for red, green, blue, and white channels.
-  wOffset = (161 >> 6) & 0b11;  // See notes in header file
-  rOffset = (161 >> 4) & 0b11;  // regarding R/G/B/W offsets
-  gOffset = (161 >> 2) & 0b11;
-  bOffset = 161 & 0b11;
+  // Pixel buffer
+  _pixels = (uint8_t*)malloc(_ledCount * 3);
+  if (!_pixels) { end(); return false; }
+  clear();
+
+#ifdef PB_CORE_V2
+  // ---- Legacy RMT settings ----
+  rmt_config_t config = {};
+  config.rmt_mode = RMT_MODE_TX;
+  config.channel = _channel;
+  config.gpio_num = _pin_enum;
+  config.mem_block_num = 1;
+  config.clk_div = RMT_CLK_DIV;
+  config.tx_config.loop_en = false;
+  config.tx_config.carrier_en = false;
+  config.tx_config.idle_output_en = true;
+  config.tx_config.idle_level = RMT_IDLE_LEVEL_LOW;
+
+  if (rmt_config(&config) != ESP_OK) { end(); return false; }
+  if (rmt_driver_install(_channel, 0, 0) != ESP_OK) { end(); return false; }
+
+  _itemsLen = _ledCount * 24;
+  _items = (rmt_item32_t*)malloc(_itemsLen * sizeof(rmt_item32_t));
+  if (!_items) { end(); return false; }
+#endif
+
+#ifdef PB_CORE_V3
+  // ---- New RMT: TX channel + BYTES encoder ----
+  rmt_tx_channel_config_t tx_cfg = {};
+  tx_cfg.gpio_num = _pin_enum;
+  tx_cfg.clk_src = RMT_CLK_SRC_DEFAULT;
+  tx_cfg.resolution_hz = RMT_RESOLUTION_HZ; // 0.1us/step
+  tx_cfg.mem_block_symbols = 64;   
+  tx_cfg.trans_queue_depth = 4;
+
+  if (rmt_new_tx_channel(&tx_cfg, &_txChannel) != ESP_OK) { end(); return false; }
+  // T0H ~0.4us => 4, T0L ~0.85us => 9
+  // T1H ~0.8us => 8, T1L ~0.45us => 5
+  rmt_bytes_encoder_config_t enc_cfg = {};
+  enc_cfg.bit0.duration0 = 4;  enc_cfg.bit0.level0 = 1;
+  enc_cfg.bit0.duration1 = 9;  enc_cfg.bit0.level1 = 0;
+  enc_cfg.bit1.duration0 = 8;  enc_cfg.bit1.level0 = 1;
+  enc_cfg.bit1.duration1 = 5;  enc_cfg.bit1.level1 = 0;
+  enc_cfg.flags.msb_first = 1; // WS2812 MSB-first
+
+  if (rmt_new_bytes_encoder(&enc_cfg, &_ledEncoder) != ESP_OK) { end(); return false; }
+
+  if (rmt_enable(_txChannel) != ESP_OK) { end(); return false; }
+
+  memset(&_txConfig, 0, sizeof(_txConfig));
+  _txConfig.loop_count = 0; 
+#endif
+
+  _begun = true;
+  return true;
 }
 
-// Sends pixel data to the NeoPixel strip and displays it.
-void NeoPixel::show(void) {
-  if (!pixels)
-    return;
-  while (!canShow());
-  espShow(pin, pixels, numBytes);
+// ---------- end() ----------
+void NeoPixel::end() {
+#ifdef PB_CORE_V2
+  if (_items) { free(_items); _items = nullptr; }
+  if (_begun) rmt_driver_uninstall(_channel);
+#endif
+#ifdef PB_CORE_V3
+  if (_begun && _txChannel) { rmt_disable(_txChannel); }
+  if (_ledEncoder) { rmt_del_encoder(_ledEncoder); _ledEncoder = nullptr; }
+  if (_txChannel)  { rmt_del_channel(_txChannel); _txChannel = nullptr; }
+#endif
+  if (_pixels) { free(_pixels); _pixels = nullptr; }
+  _begun = false;
 }
 
-// Helper function that configures RMT and sends data to the NeoPixel strip.
-void espShow(uint8_t pin, uint8_t *pixels, uint32_t numBytes) {
-  rmt_data_t led_data[numBytes * 8];
-
-  if (!rmtInit(pin, RMT_TX_MODE, RMT_MEM_NUM_BLOCKS_1, 10000000)) {
-    log_e("Failed to init RMT TX mode on pin %d", pin);
-    return;
-  }
-
-  int i = 0;
-  for (int b = 0; b < numBytes; b++) {
-    for (int bit = 0; bit < 8; bit++) {
-      if (pixels[b] & (1 << (7 - bit))) {
-        led_data[i].level0 = 1;
-        led_data[i].duration0 = 8;
-        led_data[i].level1 = 0;
-        led_data[i].duration1 = 4;
-      } else {
-        led_data[i].level0 = 1;
-        led_data[i].duration0 = 4;
-        led_data[i].level1 = 0;
-        led_data[i].duration1 = 8;
+#ifdef PB_CORE_V2
+// ---------- Legacy: pixel -> RMT item ----------
+void NeoPixel::buildItems() {
+  size_t idx = 0;
+  for (uint16_t led = 0; led < _ledCount; ++led) {
+    const uint8_t g = _pixels[led*3 + 0];
+    const uint8_t r = _pixels[led*3 + 1];
+    const uint8_t b = _pixels[led*3 + 2];
+    const uint8_t grb[3] = { g, r, b };
+    for (int c = 0; c < 3; ++c) {
+      for (int bit = 7; bit >= 0; --bit) {
+        const bool one = (grb[c] >> bit) & 0x01;
+        _items[idx].duration0 = one ? T1H_TICKS : T0H_TICKS;
+        _items[idx].level0    = 1;
+        _items[idx].duration1 = one ? T1L_TICKS : T0L_TICKS;
+        _items[idx].level1    = 0;
+        idx++;
       }
-      i++;
     }
   }
-
-  rmtWrite(pin, led_data, numBytes * 8, RMT_WAIT_FOR_EVER); // Send the data.
 }
+#endif
 
-// Sets the pin number for the NeoPixel strip and updates the pin mode accordingly.
-void NeoPixel::setPin(int16_t p) {
-  if (begun && (pin >= 0))
-    pinMode(pin, INPUT);  // Disable existing pin if already begun
-  pin = p;
-  if (begun) {
-    pinMode(p, OUTPUT);
-    digitalWrite(p, LOW);
+// ---------- show() ----------
+void NeoPixel::show() {
+  if (!_begun || !_pixels) return;
+
+#ifdef PB_CORE_V2
+  buildItems();
+  rmt_write_items(_channel, _items, _itemsLen, true);
+  rmt_wait_tx_done(_channel, pdMS_TO_TICKS(10));
+  delayMicroseconds(80);
+#endif
+
+#ifdef PB_CORE_V3
+  size_t nbytes = (size_t)_ledCount * 3;
+  if (rmt_transmit(_txChannel, _ledEncoder, _pixels, nbytes, &_txConfig) == ESP_OK) {
+    rmt_tx_wait_all_done(_txChannel, pdMS_TO_TICKS(20));
   }
+  delayMicroseconds(80); // Treset
+#endif
 }
 
-// Sets the color of a specific pixel on the NeoPixel strip by adjusting the brightness.
-void NeoPixel::setPixelColor(uint16_t n, uint8_t r, uint8_t g,  uint8_t b) {
-  if (n < numLEDs) {
-    if (brightness) {  // See notes in setBrightness()
-      r = (r * brightness) >> 8;
-      g = (g * brightness) >> 8;
-      b = (b * brightness) >> 8;
-    }
-    uint8_t *p;
-    if (wOffset == rOffset) {  // If RGB type, use 3 bytes per pixel
-      p = &pixels[n * 3];      
-    } else {                   // If RGBW type, use 4 bytes per pixel
-      p = &pixels[n * 4];      
-      p[wOffset] = 0;          
-    }
-    p[bOffset] = r;  // Set the color channels for the pixel
-    p[gOffset] = g;
-    p[rOffset] = b;
-  }
-}
-
-// Sets the brightness level for the NeoPixel strip.
-void NeoPixel::setBrightness(uint8_t b) {
-  uint8_t newBrightness = b + 1;
-  if (newBrightness != brightness) {  // Compare the new brightness with the old one
-
-    uint8_t c, *ptr = pixels,
-               oldBrightness = brightness - 1;  // De-wrap old brightness value
-    uint16_t scale;
-    if (oldBrightness == 0)
-      scale = 0;  
-    else if (b == 255)
-      scale = 65535 / oldBrightness;
-    else
-      scale = (((uint16_t)newBrightness << 8) - 1) / oldBrightness;
-    // Apply the brightness scale to all the pixels
-    for (uint16_t i = 0; i < numBytes; i++) {
-      c = *ptr;
-      *ptr++ = (c * scale) >> 8;
-    }
-    brightness = newBrightness; // Update the brightness level
-  }
-}
 
 /*****************************
 MOTOR DRIVER LIBRARY
@@ -679,16 +714,16 @@ int APDS9960::readColor(){
 
     // Return the detected color based on the highest value between red, green, and blue
     if ((red >= 500) && (green >= 500) && (blue >= 500))  // No significant color detected
-      return NONE;
+      return APDS_NONE;
     if ((red > green) && (red > blue))
-      return RED;
+      return APDS_RED;
     if ((green > red) && (green > blue))
-      return GREEN;
+      return APDS_GREEN;
     if ((blue > green) && (blue > red))
-      return BLUE;
+      return APDS_BLUE;
   }
   else
-    return NONE;  //if no valid color is detected
+    return APDS_NONE;  //if no valid color is detected
 }
 
 // The readGesture function reads the gesture data from the APDS9960 sensor.
@@ -709,7 +744,7 @@ int APDS9960::readGesture(){
     control2 = Wire.read();
 
     if ((control == 0) && (control2 == 0))  // if no valid gesture data is detected
-      return NONE;
+      return APDS_NONE;
 
     delay(3);
     // Check FIFO (First-In-First-Out) buffer status
@@ -726,7 +761,7 @@ int APDS9960::readGesture(){
     fifo_level = Wire.read();
 
     if ((gstatus == 0) && (fifo_level == 0))
-      return NONE;
+      return APDS_NONE;
 
     // Read data from the FIFO buffer
     for (int i=0; i<32; i++){
@@ -778,7 +813,7 @@ int APDS9960::readGesture(){
     }
 
     if ((u_first == 0) ||  (d_first == 0) || (l_first == 0) || (r_first == 0))  // Exit if no valid starting point is found
-      return  NONE;
+      return  APDS_NONE;
 
     // Find the last significant gesture data
     for (int i = 31; i >= 0; i--){
@@ -817,15 +852,15 @@ int APDS9960::readGesture(){
 
     // Return detected gesture based on direction
     if (APDS9960_ud_count == -1 && APDS9960_lr_count == 0) 
-      return UP;
+      return APDS_UP;
     if (APDS9960_ud_count == 1 && APDS9960_lr_count == 0) 
-      return DOWN;
+      return APDS_DOWN;
     if (APDS9960_ud_count == 0 && APDS9960_lr_count == 1) 
-      return RIGHT;
+      return APDS_RIGHT;
     if (APDS9960_ud_count == 0 && APDS9960_lr_count == -1) 
-      return LEFT;
+      return APDS_LEFT;
 
-    return NONE;
+    return APDS_NONE;
 }
 
 /*****************************

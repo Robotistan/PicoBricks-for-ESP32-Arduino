@@ -181,16 +181,17 @@ void loop() {
   }
 
   // Read color from APDS9960 sensor
-  /*
+
   color = apds.readColor();
   Serial.println(color);
-  delay(200);
-  */
 
-  // Read gesture from APDS9960 sensor
+
+/*
+  // Read color from APDS9960 sensor
   gesture = apds.readGesture();
   if (gesture != 0)
     Serial.println(gesture);
+  */
 
   // Read touch buttons
   /*
@@ -259,7 +260,7 @@ void loop() {
   OLED.print("Temp: ");
   OLED.setCursor(35, 10);
   temperature = shtc.readTemperature();
-  Serial.println(temperature);
+  //Serial.println(temperature);
   sprintf(str, "%.2f", temperature);
   OLED.print(str);
   OLED.setCursor(70, 10);
@@ -300,3 +301,4 @@ void loop() {
   OLED.print(pirState ? "1" : "0");
   OLED.show();  // Update OLED display
 }
+

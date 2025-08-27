@@ -1,4 +1,5 @@
 #include <Wire.h>
+#include <Arduino.h>
 
 //------------------IR--------------------
 #define number_1 0xA2
@@ -73,42 +74,75 @@ private:
     void readData(uint8_t *data, uint8_t len);   // Reads data from the sensor
 };
 
-void espShow(uint8_t pin, uint8_t *pixels, uint32_t numBytes);
+#ifndef ESP_ARDUINO_VERSION
+  #define ESP_ARDUINO_VERSION 0
+#endif
+#ifndef ESP_ARDUINO_VERSION_VAL
+  #define ESP_ARDUINO_VERSION_VAL(major, minor, patch) ((major)*10000 + (minor)*100 + (patch))
+#endif
+
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3,0,0)
+// Core v3.x (ESP-IDF v5, new RMT API)
+  #define PB_CORE_V3 1
+  #include <driver/rmt_tx.h>
+  #include <driver/rmt_encoder.h>
+  #include <driver/gpio.h>
+#else
+// Core v2.x (ESP-IDF v4, legacy RMT API)
+  #define PB_CORE_V2 1
+  #include <driver/rmt.h>
+#endif
 
 class NeoPixel {
 public:
-  NeoPixel(uint16_t n, int16_t p);
+  // ledCount = LED sayısı, pin = GPIO numarası (örn. 32)
+  NeoPixel(uint16_t ledCount = 3, int pin = 32
+#ifdef PB_CORE_V2
+           , rmt_channel_t rmtChannel = RMT_CHANNEL_0
+#endif
+  );
+  ~NeoPixel();
 
-  void begin(void);
-  void show(void);
-  void setPin(int16_t p);
-  void setPixelColor(uint16_t n, uint8_t r, uint8_t g, uint8_t b);
-  void setBrightness(uint8_t);
-  void updateLength(uint16_t n);
-  void updateType();
-  bool canShow(void) {
-    uint32_t now = micros();
-    if (endTime > now) {
-      endTime = now;
-    }
-    return (now - endTime) >= 300L;
-  }
-  
-  uint8_t *getPixels(void) const { return pixels; };
-  uint8_t getBrightness(void) const;
+  bool begin();                 // RMT/kanal kurulum
+  void end();                   // kaynakları sal
+  void clear();                 // buffer'ı sıfırla (show() ile uygular)
+  void setBrightness(uint8_t b);// 0–255 global parlaklık
+  void setPixelColor(uint16_t i, uint8_t r, uint8_t g, uint8_t b); // 0-based
+  void fill(uint8_t r, uint8_t g, uint8_t b);
+  void show();                  // buffer'ı LED'lere gönder
 
-protected:
-  bool begun;         ///< true if begin() previously called
-  uint16_t numLEDs;   ///< Number of RGB LEDs in strip
-  uint16_t numBytes;  ///< Size of 'pixels' buffer below
-  int16_t pin;        ///< Output pin number (-1 if not yet set)
-  uint8_t brightness; ///< Strip brightness 0-255 (stored as +1)
-  uint8_t *pixels;    ///< Holds LED color values (3 or 4 bytes each)
-  uint8_t rOffset;    ///< Red index within each 3- or 4-byte pixel
-  uint8_t gOffset;    ///< Index of green byte
-  uint8_t bOffset;    ///< Index of blue byte
-  uint8_t wOffset;    ///< Index of white (==rOffset if no white)
-  uint32_t endTime;   ///< Latch timing reference
+  uint16_t count() const { return _ledCount; }
+  int pin() const { return _pin; }
+
+private:
+  void applyBrightness(uint8_t &r, uint8_t &g, uint8_t &b) const;
+
+#ifdef PB_CORE_V2
+  static constexpr uint8_t  RMT_CLK_DIV = 2;  // 80MHz/2 => 40MHz => 25ns/tick
+  static constexpr uint16_t T0H_TICKS   = 16; // ~0.40us
+  static constexpr uint16_t T0L_TICKS   = 34; // ~0.85us
+  static constexpr uint16_t T1H_TICKS   = 32; // ~0.80us
+  static constexpr uint16_t T1L_TICKS   = 18; // ~0.45us
+  void buildItems(); // pixel -> RMT item çevir
+
+  rmt_channel_t  _channel;
+  rmt_item32_t  *_items;      // _ledCount * 24
+  size_t         _itemsLen;
+#endif
+
+#ifdef PB_CORE_V3
+  static constexpr uint32_t RMT_RESOLUTION_HZ = 10'000'000;
+
+  rmt_channel_handle_t _txChannel;
+  rmt_encoder_handle_t _ledEncoder;  // bytes encoder
+  rmt_transmit_config_t _txConfig;
+#endif
+  int            _pin;        
+  gpio_num_t     _pin_enum;   
+  uint16_t       _ledCount;
+  uint8_t        _brightness; // 0–255
+  uint8_t       *_pixels;     // GRB sırası, size = _ledCount*3
+  bool           _begun;
 };
 
 class motorDriver {
@@ -125,15 +159,15 @@ public:
 #define COLOR   1
 #define GESTURE 2
 
-#define NONE  0
-#define RED   1
-#define GREEN 2
-#define BLUE  3
+#define APDS_NONE  0
+#define APDS_RED   1
+#define APDS_GREEN 2
+#define APDS_BLUE  3
 
-#define UP    1
-#define DOWN  2
-#define LEFT  3
-#define RIGHT 4
+#define APDS_UP    1
+#define APDS_DOWN  2
+#define APDS_LEFT  3
+#define APDS_RIGHT 4
 
 class APDS9960 {
 public:
